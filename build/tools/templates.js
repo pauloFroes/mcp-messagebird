@@ -62,7 +62,7 @@ export function registerTemplateTools(server) {
                 .describe("Template name (lowercase, underscores, no spaces)"),
             language: z.string().describe("Language code (e.g. en, pt_BR)"),
             category: z
-                .enum(["TRANSACTIONAL", "MARKETING", "AUTHENTICATION"])
+                .enum(["UTILITY", "MARKETING", "AUTHENTICATION"])
                 .describe("Template category"),
             body_text: z
                 .string()
@@ -146,6 +146,11 @@ export function registerTemplateTools(server) {
                 }
                 else if (button_type === "URL" && button_value) {
                     button.url = button_value;
+                    if (button_value.includes("{{")) {
+                        button.example = [
+                            button_value.replace(/\{\{\d+\}\}/g, "example_value"),
+                        ];
+                    }
                 }
                 components.push({
                     type: "BUTTONS",
