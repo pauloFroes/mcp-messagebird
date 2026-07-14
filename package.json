@@ -1,6 +1,6 @@
 {
   "name": "@paulofroes/mcp-messagebird",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "MCP server that wraps the messagebird API as semantic tools for LLM agents",
   "type": "module",
   "bin": {

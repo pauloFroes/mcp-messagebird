@@ -5,6 +5,7 @@ import { registerMessagingTools } from "./tools/messaging.js";
 import { registerConversationTools } from "./tools/conversations.js";
 import { registerTemplateTools } from "./tools/templates.js";
 import { registerContactTools } from "./tools/contacts.js";
+import { registerAccountTools } from "./tools/account.js";
 const server = new McpServer({
     name: "mcp-messagebird",
     version: "1.0.0",
@@ -13,6 +14,7 @@ registerMessagingTools(server);
 registerConversationTools(server);
 registerTemplateTools(server);
 registerContactTools(server);
+registerAccountTools(server);
 async function main() {
     const transport = new StdioServerTransport();
     await server.connect(transport);

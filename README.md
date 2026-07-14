@@ -190,6 +190,12 @@ Add to `~/.codeium/windsurf/mcp_config.json`:
 | `update_contact` | Update contact information |
 | `delete_contact` | Permanently delete a contact |
 
+### Account
+
+| Tool | Description |
+|------|-------------|
+| `get_balance` | Get the account balance (payment model, currency, and amount) |
+
 ## Authentication
 
 Uses MessageBird API Key authentication. The key is passed via the `Authorization: AccessKey {key}` header on every request. The API key is set as the `MESSAGEBIRD_API_KEY` environment variable at installation time.
