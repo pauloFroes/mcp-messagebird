@@ -173,13 +173,24 @@ Add to `~/.codeium/windsurf/mcp_config.json`:
 
 | Param | Values | Notes |
 |-------|--------|-------|
-| `status` | `active` (default), `archived`, `all` | Native Conversations API lifecycle filter. **Not** Inbox ticket status. |
+| `status` | `active` (default), `archived`, `all` | **Native** Conversations API lifecycle filter. |
 | `ids` | comma-separated (max 20) | Fetch specific conversations |
 | `offset` / `limit` | pagination | API max `limit` = 20 |
-| `waiting_for_reply` | `true` / `false` | Intelligent filter: active threads where the **contact spoke last** and **no human Inbox agent** has replied yet. Flow Builder auto-replies (`origin=flows`) do **not** clear waiting state. |
-| `scan_limit` | 1–100 (default 40) | Only with `waiting_for_reply`: how many recent active conversations to inspect |
+| `proxy` | `none`, `waiting_for_reply`, `assigned_open`, `assigned_open_waiting` | **Client-side approximations** (see below) |
+| `scan_limit` | 1–100 (default 40) | With a proxy: how many recent active conversations to inspect |
+| `message_scan_limit` | 20–100 (default 40) | With a proxy: max messages loaded per conversation |
 
-**Important:** Conversations API has no assignee/ticket field. `waiting_for_reply` is the supported way to answer “client is waiting for a human”. Human reply = `origin=inbox` with a real `source.agentId` (not “Inbox Automation”).
+**Proxies (MessageBird Conversations API only — incomplete by design)**
+
+The Conversations API has **no assignee field**. Proxies reconstruct state from message rows:
+
+| Proxy | Rule |
+|-------|------|
+| `waiting_for_reply` | Last non-event message is from the contact; no later human Inbox agent reply (`origin=inbox` + real `agentId`). Flow Builder does **not** clear waiting. |
+| `assigned_open` | Conversation is `active` **and** the latest `ticketLifecycleAssigned` event (real agent) is more recent than any Unassigned in the scanned message window. |
+| `assigned_open_waiting` | Both of the above |
+
+Threads with **no** `ticketLifecycle*` events in the scanned window are **invisible** to `assigned_open` (typical of bot-only contacts).
 
 ### Templates
 

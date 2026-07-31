@@ -3,9 +3,22 @@ import { apiRequest, toolResult, toolError } from "../client.js";
 /** Conversation lifecycle status as defined by Conversations API. */
 const CONVERSATION_STATUS = z
     .enum(["active", "archived", "all"])
-    .describe("Conversation lifecycle status (Conversations API). " +
+    .describe("Conversation lifecycle status (Conversations API only). " +
     "active = open thread (default), archived = closed/archived, all = both. " +
-    "This is NOT Inbox ticket status (pending/assigned) — use waiting_for_reply for that need.");
+    "This is NOT Inbox assignee/ticket status — use proxy=assigned_open for that approximation.");
+/**
+ * Client-side proxies built only from Conversations API data
+ * (no Collaborations/Bird Inbox API).
+ */
+const PROXY_FILTER = z
+    .enum(["none", "waiting_for_reply", "assigned_open", "assigned_open_waiting"])
+    .describe("Client-side approximation (MessageBird Conversations API has no assignee field). " +
+    "none = native list only. " +
+    "waiting_for_reply = contact spoke last, no human Inbox agent replied. " +
+    "assigned_open = ticketLifecycleAssigned to a real agent is the latest assignment event " +
+    "(and no later Unassigned) on an active conversation — reconstructed from type=event messages. " +
+    "assigned_open_waiting = assigned_open AND waiting_for_reply. " +
+    "INCOMPLETE: only threads with ticket events in the scanned message window are visible.");
 function isEventMessage(msg) {
     return msg.type === "event" || msg.platform === "events";
 }
@@ -81,6 +94,116 @@ export function evaluateWaitingForReply(messages) {
         reason: "No inbound contact message found in the recent window (or only automation traffic).",
     };
 }
+function agentFromSource(msg) {
+    const src = msg.source || {};
+    const agent = src.inboxAgent && (src.inboxAgent.id || "").trim()
+        ? src.inboxAgent
+        : src.changedByInboxAgent && (src.changedByInboxAgent.id || "").trim()
+            ? src.changedByInboxAgent
+            : null;
+    const agentId = (src.agentId || agent?.id || "").trim();
+    if (!agentId)
+        return null;
+    const name = (agent?.fullName || "").trim() ||
+        [agent?.firstName, agent?.lastName].filter(Boolean).join(" ").trim() ||
+        agentId;
+    // Ignore pure automation actor
+    if (name === "Inbox Automation")
+        return null;
+    return { agentId, name };
+}
+/**
+ * Reconstruct Inbox-ish ticket state from Conversations message events.
+ * Only MessageBird Conversations API — events like ticketLifecycleAssigned
+ * appear as type=event rows when the Inbox product wrote them.
+ *
+ * Messages are expected newest-first (API default). We process oldest→newest
+ * so the last assignment/substatus wins.
+ */
+export function evaluateTicketProxy(messagesNewestFirst, conversationStatus) {
+    const chronological = [...messagesNewestFirst].reverse();
+    const eventsSeen = [];
+    let assignee = null;
+    let assigned = false;
+    let substatus = null;
+    let substatusAt;
+    let sawAssignOrUnassign = false;
+    for (const msg of chronological) {
+        const et = msg.eventType || "";
+        if (!et.startsWith("ticketLifecycle") && msg.type !== "event")
+            continue;
+        if (!et)
+            continue;
+        eventsSeen.push(et);
+        if (et === "ticketLifecycleAssigned") {
+            const agent = agentFromSource(msg);
+            if (agent) {
+                assigned = true;
+                assignee = { ...agent, at: msg.createdDatetime };
+                sawAssignOrUnassign = true;
+            }
+        }
+        else if (et === "ticketLifecycleUnassigned" ||
+            et === "ticketLifecycleUnAssigned") {
+            assigned = false;
+            assignee = null;
+            sawAssignOrUnassign = true;
+        }
+        else if (et === "ticketLifecycleSubstatusActive") {
+            substatus = "active";
+            substatusAt = msg.createdDatetime;
+        }
+        else if (et === "ticketLifecycleSubstatusPending") {
+            substatus = "pending";
+            substatusAt = msg.createdDatetime;
+        }
+        // Future-proof: treat closed/resolved-like events as not open assigned
+        else if (/resolved|closed|completed|done/i.test(et) ||
+            /resolved|closed/i.test((msg.content?.text || "").toString())) {
+            // Keep assignee info but mark as not "open" via substatus null + note
+            substatus = null;
+            substatusAt = msg.createdDatetime;
+            eventsSeen.push(`${et}:closed_signal`);
+        }
+    }
+    const convActive = !conversationStatus || conversationStatus === "active";
+    const assigned_open = convActive && assigned && !!assignee;
+    const has_ticket_signal = eventsSeen.length > 0;
+    const confidence = sawAssignOrUnassign
+        ? "high"
+        : "low";
+    let note;
+    if (!has_ticket_signal) {
+        note =
+            "No ticketLifecycle* events in the scanned message window. " +
+                "Cannot confirm assignment (most bot-only threads never get these events).";
+    }
+    else if (!sawAssignOrUnassign) {
+        note =
+            "Saw ticket substatus events but no Assigned/Unassigned in window. " +
+                "Assignment may be older than the scanned messages.";
+    }
+    else if (assigned_open) {
+        note =
+            "Proxy: active conversation + latest assignment event is Assigned to a real agent. " +
+                "Not an official Conversations API filter.";
+    }
+    else {
+        note = "Latest assignment signal is unassigned or has no real agent id.";
+    }
+    return {
+        assigned,
+        assignee,
+        substatus,
+        substatusAt,
+        assigned_open,
+        has_ticket_signal,
+        events_seen: [...new Set(eventsSeen)],
+        messages_scanned: messagesNewestFirst.length,
+        confidence,
+        note,
+    };
+}
 function clampInt(raw, fallback, min, max) {
     if (raw === undefined || raw === "")
         return fallback;
@@ -97,17 +220,33 @@ function contactLabel(c) {
         c.contactId ||
         c.id);
 }
+/** Fetch up to maxMessages (newest first), paging by 20. */
+async function fetchMessages(conversationId, maxMessages) {
+    const out = [];
+    let offset = 0;
+    const pageSize = 20;
+    while (out.length < maxMessages) {
+        const batch = Math.min(pageSize, maxMessages - out.length);
+        const page = await apiRequest(`/conversations/${conversationId}/messages`, "GET", undefined, { limit: String(batch), offset: String(offset) });
+        const items = page.items || [];
+        out.push(...items);
+        if (items.length < batch)
+            break;
+        offset += items.length;
+    }
+    return out;
+}
 export function registerConversationTools(server) {
     // --- List conversations ---
     server.registerTool("list_conversations", {
         title: "List Conversations",
-        description: "List conversation threads across channels. " +
-            "Supports native Conversations API status filter (active|archived|all) and an " +
-            "intelligent waiting_for_reply filter that finds active threads where the contact " +
-            "spoke last and no human Inbox agent has replied yet (Flow Builder auto-replies " +
-            "do NOT count as agent reply). " +
-            "Note: Inbox assignee/ticket status is NOT exposed by Conversations API — " +
-            "waiting_for_reply is the supported heuristic for 'client waiting'.",
+        description: "List MessageBird Conversations API threads. " +
+            "Native filter: status=active|archived|all. " +
+            "Proxies (client-side, incomplete): waiting_for_reply, assigned_open " +
+            "(from ticketLifecycle* events in message history), assigned_open_waiting. " +
+            "Conversations API has NO assignee field — assigned_open is a reconstruction, " +
+            "not an official list filter. Prefer small scan_limit; each conversation costs " +
+            "extra message GETs.",
         inputSchema: {
             status: CONVERSATION_STATUS.optional(),
             ids: z
@@ -118,29 +257,37 @@ export function registerConversationTools(server) {
             limit: z
                 .string()
                 .optional()
-                .describe("Max items per page (default: 20, API max: 20). With waiting_for_reply, this is the max matching results to return."),
+                .describe("Max items to return (default: 20, max: 20). With a proxy filter, this is max matches."),
+            proxy: PROXY_FILTER.optional(),
             waiting_for_reply: z
                 .boolean()
                 .optional()
-                .describe("If true, only return active conversations where the last meaningful message " +
-                "is from the contact and no human Inbox agent has replied after it. " +
-                "Scans recent active conversations and enriches each match with waiting metadata. " +
-                "Implies status=active (archived threads are skipped)."),
+                .describe("Deprecated alias: true ≡ proxy=waiting_for_reply. Prefer `proxy`."),
             scan_limit: z
                 .string()
                 .optional()
-                .describe("Only with waiting_for_reply: max conversations to inspect while scanning " +
-                "(default: 40, max: 100). Paginated in pages of 20."),
+                .describe("With a proxy filter: max conversations to inspect (default: 40, max: 100). " +
+                "Paginated in pages of 20."),
+            message_scan_limit: z
+                .string()
+                .optional()
+                .describe("With a proxy filter: max messages to load per conversation when reconstructing " +
+                "ticket/waiting state (default: 40, max: 100). Higher catches older Assigned events."),
         },
         annotations: {
             readOnlyHint: true,
             destructiveHint: false,
             openWorldHint: true,
         },
-    }, async ({ status, ids, offset, limit, waiting_for_reply, scan_limit }) => {
+    }, async ({ status, ids, offset, limit, proxy, waiting_for_reply, scan_limit, message_scan_limit, }) => {
         try {
             const pageLimit = clampInt(limit, 20, 1, 20);
-            if (!waiting_for_reply) {
+            // Resolve proxy mode (backward compatible with waiting_for_reply boolean)
+            let mode = proxy ?? "none";
+            if (waiting_for_reply === true && mode === "none") {
+                mode = "waiting_for_reply";
+            }
+            if (mode === "none") {
                 const data = await apiRequest("/conversations", "GET", undefined, {
                     status: status ?? "active",
                     ids,
@@ -151,23 +298,27 @@ export function registerConversationTools(server) {
                     ...data,
                     filter: {
                         status: status ?? "active",
-                        waiting_for_reply: false,
+                        proxy: "none",
                         ids: ids || null,
+                        api: "MessageBird Conversations API only",
                     },
                 });
             }
-            // --- Intelligent waiting_for_reply scan ---
+            // --- Proxy scans (active only) ---
             if (status && status !== "active" && status !== "all") {
-                return toolError("waiting_for_reply only applies to active conversations. " +
-                    "Omit status or use status=active (archived threads are never 'waiting').");
+                return toolError(`proxy=${mode} only applies to active conversations. ` +
+                    "Omit status or use status=active.");
             }
             const maxScan = clampInt(scan_limit, 40, 1, 100);
+            const maxMsgs = clampInt(message_scan_limit, 40, 20, 100);
             const startOffset = clampInt(offset, 0, 0, 1_000_000);
             const matches = [];
             let scanned = 0;
             let pageOffset = startOffset;
             let totalActive;
             const errors = [];
+            let withTicketSignal = 0;
+            let withAssigned = 0;
             while (scanned < maxScan && matches.length < pageLimit) {
                 const batchSize = Math.min(20, maxScan - scanned);
                 const page = await apiRequest("/conversations", "GET", undefined, {
@@ -185,13 +336,27 @@ export function registerConversationTools(server) {
                         break;
                     scanned += 1;
                     try {
-                        const msgs = await apiRequest(`/conversations/${conv.id}/messages`, "GET", undefined, { limit: "20", offset: "0" });
-                        const verdict = evaluateWaitingForReply(msgs.items || []);
-                        if (verdict.waiting) {
+                        const msgs = await fetchMessages(conv.id, maxMsgs);
+                        const waiting = evaluateWaitingForReply(msgs);
+                        const ticket = evaluateTicketProxy(msgs, conv.status);
+                        if (ticket.has_ticket_signal)
+                            withTicketSignal += 1;
+                        if (ticket.assigned)
+                            withAssigned += 1;
+                        let keep = false;
+                        if (mode === "waiting_for_reply")
+                            keep = waiting.waiting;
+                        else if (mode === "assigned_open")
+                            keep = ticket.assigned_open;
+                        else if (mode === "assigned_open_waiting") {
+                            keep = ticket.assigned_open && waiting.waiting;
+                        }
+                        if (keep) {
                             matches.push({
                                 ...conv,
                                 contactLabel: contactLabel(conv),
-                                waiting: verdict,
+                                waiting,
+                                ticket,
                             });
                         }
                     }
@@ -213,15 +378,28 @@ export function registerConversationTools(server) {
                 offset: startOffset,
                 scanned,
                 scan_limit: maxScan,
+                message_scan_limit: maxMsgs,
                 next_scan_offset: pageOffset,
                 totalActiveCount: totalActive,
+                stats: {
+                    with_ticket_signal: withTicketSignal,
+                    with_assigned: withAssigned,
+                    matches: matches.length,
+                },
                 filter: {
                     status: "active",
-                    waiting_for_reply: true,
+                    proxy: mode,
                     ids: ids || null,
-                    definition: "waiting = last non-event message is direction=received, " +
-                        "with no later human Inbox agent reply (origin=inbox / agentId). " +
-                        "Flow Builder and ticket automation do not clear waiting state.",
+                    api: "MessageBird Conversations API only",
+                    disclaimer: "assigned_open is reconstructed from ticketLifecycle* message events. " +
+                        "Threads without those events in the scanned window are invisible to this filter. " +
+                        "This is NOT an official MessageBird list filter for Inbox assignee.",
+                    definitions: {
+                        waiting_for_reply: "Last non-event message is direction=received; no later human Inbox agent reply.",
+                        assigned_open: "Conversation status=active AND latest ticketLifecycleAssigned " +
+                            "(with real agentId) is more recent than any Unassigned in the message window.",
+                        assigned_open_waiting: "assigned_open AND waiting_for_reply",
+                    },
                 },
                 ...(errors.length ? { errors } : {}),
             });
@@ -281,7 +459,8 @@ export function registerConversationTools(server) {
         description: "List all messages in a specific conversation. Returns paginated message history " +
             "(newest first). Event/ticket lifecycle rows have type=event — skip them when " +
             "judging who spoke last. Human agent replies have origin=inbox and source.agentId; " +
-            "bot replies have origin=flows.",
+            "bot replies have origin=flows. Ticket proxy events: ticketLifecycleAssigned, " +
+            "ticketLifecycleSubstatusActive/Pending.",
         inputSchema: {
             conversation_id: z.string().describe("Conversation ID"),
             offset: z.string().optional().describe("Number of items to skip (default: 0)"),
