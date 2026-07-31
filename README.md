@@ -161,13 +161,25 @@ Add to `~/.codeium/windsurf/mcp_config.json`:
 
 | Tool | Description |
 |------|-------------|
-| `list_conversations` | List all conversation threads |
+| `list_conversations` | List conversation threads with filters (see below) |
 | `get_conversation` | Get conversation details by ID |
 | `update_conversation` | Update conversation status (active/archived) |
 | `list_conversation_messages` | List messages in a conversation |
 | `get_message` | Get a specific message |
 | `reply_to_conversation` | Send a reply in an existing conversation |
-| `list_messages` | List messages across all conversations |
+| `list_messages` | Fetch messages by `ids` or recent `from` window (max 5 min) |
+
+#### `list_conversations` filters
+
+| Param | Values | Notes |
+|-------|--------|-------|
+| `status` | `active` (default), `archived`, `all` | Native Conversations API lifecycle filter. **Not** Inbox ticket status. |
+| `ids` | comma-separated (max 20) | Fetch specific conversations |
+| `offset` / `limit` | pagination | API max `limit` = 20 |
+| `waiting_for_reply` | `true` / `false` | Intelligent filter: active threads where the **contact spoke last** and **no human Inbox agent** has replied yet. Flow Builder auto-replies (`origin=flows`) do **not** clear waiting state. |
+| `scan_limit` | 1–100 (default 40) | Only with `waiting_for_reply`: how many recent active conversations to inspect |
+
+**Important:** Conversations API has no assignee/ticket field. `waiting_for_reply` is the supported way to answer “client is waiting for a human”. Human reply = `origin=inbox` with a real `source.agentId` (not “Inbox Automation”).
 
 ### Templates
 
