@@ -76,7 +76,7 @@ export function evaluateWaitingForReply(messages) {
         if (msg.direction === "received") {
             return {
                 waiting: true,
-                reason: "Last meaningful message is from the contact; no human Inbox agent replied after it.",
+                reason: "Last meaningful message is from the contact; no human agent/API reply after it.",
                 lastMeaningful: preview,
             };
         }
@@ -87,7 +87,16 @@ export function evaluateWaitingForReply(messages) {
                 lastMeaningful: preview,
             };
         }
-        // sent by flows / api / unknown automation — keep scanning older messages
+        // Flow Builder is auto and does NOT clear waiting. API replies (e.g. MCP
+        // reply_to_conversation) DO clear waiting — they are intentional agent actions.
+        if (msg.direction === "sent" && msg.origin === "api") {
+            return {
+                waiting: false,
+                reason: "An API/agent reply was sent after the last contact message.",
+                lastMeaningful: preview,
+            };
+        }
+        // sent by flows / unknown automation — keep scanning older messages
     }
     return {
         waiting: false,
